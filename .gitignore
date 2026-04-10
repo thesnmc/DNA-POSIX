@@ -1,0 +1,13 @@
+# Python Virtual Environments
+dna_vfs/venv/
+dna_vfs/__pycache__/
+
+# Rust Compiled Binaries
+dna_vfs_core/target/
+
+# Secret Keys & Caches (NEVER UPLOAD THESE)
+dna_vfs/master.key
+dna_vfs/.dna_cache/
+dna_vfs/.bio_trash/
+dna_vfs/physical_pool/
+dna_vfs/bio_drive/
