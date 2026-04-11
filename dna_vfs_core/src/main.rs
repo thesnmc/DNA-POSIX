@@ -91,7 +91,11 @@ struct DnaNode {
     ino: u64,
     name: String,
     size: u64,
-    content: Vec<u8>, // RAM Cache
+    content: Vec<u8>,
+    // V8 FEATURE: POSIX Permissions
+    uid: u32,
+    gid: u32,
+    perm: u16,
 }
 
 struct DnaVfs {
@@ -109,7 +113,7 @@ impl DnaVfs {
         }
     }
 
-    fn generate_attr(&self, ino: u64, size: u64, kind: FileType) -> FileAttr {
+    fn generate_attr(&self, ino: u64, size: u64, kind: FileType, uid: u32, gid: u32, perm: u16) -> FileAttr {
         FileAttr {
             ino,
             size,
@@ -119,10 +123,10 @@ impl DnaVfs {
             ctime: UNIX_EPOCH,
             crtime: UNIX_EPOCH,
             kind,
-            perm: if kind == FileType::Directory { 0o755 } else { 0o644 },
+            perm,
             nlink: if kind == FileType::Directory { 2 } else { 1 },
-            uid: 1000,
-            gid: 1000,
+            uid,
+            gid,
             rdev: 0,
             flags: 0,
             blksize: 512,
@@ -133,9 +137,9 @@ impl DnaVfs {
 impl Filesystem for DnaVfs {
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
         if ino == ROOT_INODE {
-            reply.attr(&TTL, &self.generate_attr(ino, 0, FileType::Directory));
+            reply.attr(&TTL, &self.generate_attr(ino, 0, FileType::Directory, 1000, 1000, 0o755));
         } else if let Some(node) = self.nodes.get(&ino) {
-            reply.attr(&TTL, &self.generate_attr(ino, node.size, FileType::RegularFile));
+            reply.attr(&TTL, &self.generate_attr(ino, node.size, FileType::RegularFile, node.uid, node.gid, node.perm));
         } else {
             reply.error(ENOENT);
         }
@@ -160,13 +164,13 @@ impl Filesystem for DnaVfs {
         let name_str = name.to_string_lossy().to_string();
         
         if let Some(node) = self.nodes.values().find(|n| n.name == name_str) {
-            reply.entry(&TTL, &self.generate_attr(node.ino, node.size, FileType::RegularFile), 0);
+            reply.entry(&TTL, &self.generate_attr(node.ino, node.size, FileType::RegularFile, node.uid, node.gid, node.perm), 0);
         } else {
             reply.error(ENOENT);
         }
     }
 
-    fn create(&mut self, _req: &Request, parent: u64, name: &OsStr, _mode: u32, _umask: u32, _flags: i32, reply: ReplyCreate) {
+    fn create(&mut self, req: &Request, parent: u64, name: &OsStr, mode: u32, _umask: u32, _flags: i32, reply: ReplyCreate) {
         if parent != ROOT_INODE { reply.error(ENOENT); return; }
         let ino = self.next_ino;
         self.next_ino += 1;
@@ -176,13 +180,19 @@ impl Filesystem for DnaVfs {
             name: name.to_string_lossy().to_string(),
             size: 0,
             content: Vec::new(),
+            uid: req.uid(),
+            gid: req.gid(),
+            perm: mode as u16,
         };
         
+        let uid = node.uid;
+        let gid = node.gid;
+        let perm = node.perm;
+
         self.nodes.insert(ino, node);
-        reply.created(&TTL, &self.generate_attr(ino, 0, FileType::RegularFile), 0, 0, 0);
+        reply.created(&TTL, &self.generate_attr(ino, 0, FileType::RegularFile, uid, gid, perm), 0, 0, 0);
     }
 
-    // INTERCEPT WRITE: Save to RAM Cache
     fn write(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, data: &[u8], _write_flags: u32, _flags: i32, _lock_owner: Option<u64>, reply: ReplyWrite) {
         if let Some(node) = self.nodes.get_mut(&ino) {
             let offset = offset as usize;
@@ -197,19 +207,29 @@ impl Filesystem for DnaVfs {
         }
     }
 
-    // INTERCEPT FLUSH: Trigger Goldman Encoding & Save to Physical Disk
+    // V8 FEATURE: Zstd Compression + POSIX Metadata Encoding
     fn flush(&mut self, _req: &Request, ino: u64, _fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
         if let Some(node) = self.nodes.get(&ino) {
             if node.content.is_empty() { reply.ok(); return; }
 
-            println!("[+] FLUSH TRIGGERED: Encoding {} to DNA...", node.name);
-            let primer = generate_primer(&node.name);
-            let checksum = compute_checksum(&node.content);
+            println!("[+] FLUSH TRIGGERED: Compressing & Encoding {}...", node.name);
             
-            let mut payload = Vec::new();
-            payload.extend_from_slice(&checksum.to_be_bytes());
-            payload.extend_from_slice(&node.content);
+            // 1. Zstd Compression
+            let compressed_data = zstd::encode_all(node.content.as_slice(), 3).unwrap_or_else(|_| node.content.clone());
+            println!("    -> Compression Ratio: {} bytes -> {} bytes", node.content.len(), compressed_data.len());
 
+            // 2. POSIX Metadata Injection
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&node.uid.to_be_bytes());
+            payload.extend_from_slice(&node.gid.to_be_bytes());
+            payload.extend_from_slice(&node.perm.to_be_bytes());
+            
+            // 3. Checksum & Data
+            let checksum = compute_checksum(&compressed_data);
+            payload.extend_from_slice(&checksum.to_be_bytes());
+            payload.extend_from_slice(&compressed_data);
+
+            let primer = generate_primer(&node.name);
             let chunk_size = 8;
             let mut pool: Vec<String> = Vec::new();
             
@@ -222,12 +242,12 @@ impl Filesystem for DnaVfs {
             
             let fasta_path = format!("{}/{}.fasta", self.pool_dir, node.name);
             fs::write(fasta_path, pool.join("\n")).unwrap_or_default();
-            println!("[+] SUCCESS: DNA Pool written to physical storage.");
+            println!("[+] SUCCESS: DNA Pool written to TMPFS.");
         }
         reply.ok();
     }
 
-    // INTERCEPT OPEN: Trigger Biological Sequencing from Disk
+    // V8 FEATURE: Zstd Decompression + POSIX Metadata Decoding
     fn open(&mut self, _req: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
         if let Some(node) = self.nodes.get_mut(&ino) {
             let fasta_path = format!("{}/{}.fasta", self.pool_dir, node.name);
@@ -253,13 +273,23 @@ impl Filesystem for DnaVfs {
                     if let Some(chunk) = blocks.get(&i) { reassembled.extend_from_slice(chunk); }
                 }
 
-                if reassembled.len() >= 4 {
-                    let expected = u32::from_be_bytes([reassembled[0], reassembled[1], reassembled[2], reassembled[3]]);
-                    let actual_data = &reassembled[4..];
-                    if compute_checksum(actual_data) == expected {
-                        node.content = actual_data.to_vec();
-                        node.size = node.content.len() as u64;
-                        println!("[+] SUCCESS: DNA Decoded & Adler-32 Verified.");
+                if reassembled.len() >= 14 { // 4(uid) + 4(gid) + 2(perm) + 4(checksum)
+                    let mut idx = 0;
+                    node.uid = u32::from_be_bytes([reassembled[idx], reassembled[idx+1], reassembled[idx+2], reassembled[idx+3]]); idx+=4;
+                    node.gid = u32::from_be_bytes([reassembled[idx], reassembled[idx+1], reassembled[idx+2], reassembled[idx+3]]); idx+=4;
+                    node.perm = u16::from_be_bytes([reassembled[idx], reassembled[idx+1]]); idx+=2;
+                    
+                    let expected_chk = u32::from_be_bytes([reassembled[idx], reassembled[idx+1], reassembled[idx+2], reassembled[idx+3]]); idx+=4;
+                    let compressed_data = &reassembled[idx..];
+
+                    if compute_checksum(compressed_data) == expected_chk {
+                        if let Ok(decompressed) = zstd::decode_all(compressed_data) {
+                            node.content = decompressed;
+                            node.size = node.content.len() as u64;
+                            println!("[+] SUCCESS: DNA Decoded, POSIX loaded, and Zstd Decompressed.");
+                        } else {
+                            eprintln!("[-] CRITICAL: Zstd Decompression Failed!");
+                        }
                     } else {
                         eprintln!("[-] CRITICAL: Adler-32 Verification Failed!");
                     }
@@ -271,7 +301,6 @@ impl Filesystem for DnaVfs {
         }
     }
 
-    // INTERCEPT READ: Serve decoded RAM Cache back to the user
     fn read(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, size: u32, _flags: i32, _lock_owner: Option<u64>, reply: ReplyData) {
         if let Some(node) = self.nodes.get(&ino) {
             let offset = offset as usize;
@@ -287,23 +316,23 @@ impl Filesystem for DnaVfs {
         }
     }
 
-    // Required by Linux to handle truncations (e.g. echo > file)
-    // Required by Linux to handle truncations (e.g. echo > file)
-    fn setattr(&mut self, _req: &Request, ino: u64, _mode: Option<u32>, _uid: Option<u32>, _gid: Option<u32>, size: Option<u64>, _atime: Option<fuser::TimeOrNow>, _mtime: Option<fuser::TimeOrNow>, _ctime: Option<SystemTime>, _fh: Option<u64>, _crtime: Option<SystemTime>, _chgtime: Option<SystemTime>, _bkuptime: Option<SystemTime>, _flags: Option<u32>, reply: ReplyAttr) {
-        // 1. Get the mutable lock, update the size, and extract the final number
-        let final_size = if let Some(node) = self.nodes.get_mut(&ino) {
+    fn setattr(&mut self, _req: &Request, ino: u64, mode: Option<u32>, uid: Option<u32>, gid: Option<u32>, size: Option<u64>, _atime: Option<fuser::TimeOrNow>, _mtime: Option<fuser::TimeOrNow>, _ctime: Option<SystemTime>, _fh: Option<u64>, _crtime: Option<SystemTime>, _chgtime: Option<SystemTime>, _bkuptime: Option<SystemTime>, _flags: Option<u32>, reply: ReplyAttr) {
+        let (final_size, final_uid, final_gid, final_perm) = if let Some(node) = self.nodes.get_mut(&ino) {
             if let Some(s) = size {
                 node.size = s;
                 node.content.truncate(s as usize);
             }
-            node.size
+            if let Some(m) = mode { node.perm = m as u16; }
+            if let Some(u) = uid { node.uid = u; }
+            if let Some(g) = gid { node.gid = g; }
+            
+            (node.size, node.uid, node.gid, node.perm)
         } else {
             reply.error(ENOENT);
             return;
-        }; // The mutable lock automatically drops right here!
+        };
 
-        // 2. Safely call the immutable generate_attr
-        reply.attr(&TTL, &self.generate_attr(ino, final_size, FileType::RegularFile));
+        reply.attr(&TTL, &self.generate_attr(ino, final_size, FileType::RegularFile, final_uid, final_gid, final_perm));
     }
 }
 
@@ -315,12 +344,11 @@ fn main() {
     }
     let mountpoint = &args[1];
     
-    // Hardcoded physical pool path based on V8 architecture
     let home = env::var("HOME").unwrap_or_else(|_| "/root".to_string());
     let pool_dir = format!("{}/dna-posix/dna_vfs/.dna_cache/physical_pool", home);
 
     println!("[*] Booting TheSNMC DNA-POSIX V8 Engine (Native Rust)");
-    println!("[*] Physical Backing Pool: {}", pool_dir);
+    println!("[*] Physical Backing Pool (TMPFS): {}", pool_dir);
     println!("[*] Mounting pure-metal FUSE driver at: {}", mountpoint);
 
     let vfs = DnaVfs::new(pool_dir);
