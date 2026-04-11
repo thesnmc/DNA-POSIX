@@ -1,13 +1,46 @@
+use crossterm::{
+    event::{self, Event, KeyCode},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
 use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
     ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
 };
 use libc::ENOENT;
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Style},
+    widgets::{Block, Borders, List, ListItem, Paragraph},
+    Terminal,
+};
 use std::collections::HashMap;
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
+use std::io;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+// ==========================================
+// 📊 SHARED MEMORY (NEURAL LINK FOR TUI)
+// ==========================================
+
+struct EngineMetrics {
+    raw_bytes: u64,
+    compressed_bytes: u64,
+    reads: u64,
+    writes: u64,
+    logs: Vec<String>,
+}
+
+impl EngineMetrics {
+    fn log(&mut self, msg: String) {
+        self.logs.push(msg);
+        if self.logs.len() > 15 { self.logs.remove(0); } // Keep last 15 logs on screen
+    }
+}
 
 // ==========================================
 // 🧬 THE BIOLOGICAL CORE (YOUR EXACT MATH)
@@ -84,10 +117,6 @@ fn decode_oligo(primer: &str, dna: &str) -> Vec<u8> {
 // 🚀 THE KERNEL BRIDGE (FUSE VFS)
 // ==========================================
 
-// ==========================================
-// 🚀 THE KERNEL BRIDGE (FUSE VFS)
-// ==========================================
-
 const TTL: Duration = Duration::from_secs(1);
 const ROOT_INODE: u64 = 1;
 
@@ -96,7 +125,6 @@ struct DnaNode {
     name: String,
     size: u64,
     content: Vec<u8>,
-    // V8 FEATURE: POSIX Permissions
     uid: u32,
     gid: u32,
     perm: u16,
@@ -105,39 +133,30 @@ struct DnaNode {
 struct DnaVfs {
     nodes: HashMap<u64, DnaNode>,
     next_ino: u64,
-    pool_dir: String,      // Vault A
-    mirror_dir: String,    // Vault B (RAID 1)
-    journal_dir: String,   // WAL Journal
+    pool_dir: String,      
+    mirror_dir: String,    
+    journal_dir: String,   
+    metrics: Arc<Mutex<EngineMetrics>>, // Neural Link to TUI
 }
 
 impl DnaVfs {
-    fn new(pool_dir: String, mirror_dir: String, journal_dir: String) -> Self {
+    fn new(pool_dir: String, mirror_dir: String, journal_dir: String, metrics: Arc<Mutex<EngineMetrics>>) -> Self {
         Self {
             nodes: HashMap::new(),
             next_ino: 2,
             pool_dir,
             mirror_dir,
             journal_dir,
+            metrics,
         }
     }
 
     fn generate_attr(&self, ino: u64, size: u64, kind: FileType, uid: u32, gid: u32, perm: u16) -> FileAttr {
         FileAttr {
-            ino,
-            size,
-            blocks: (size + 511) / 512,
-            atime: UNIX_EPOCH,
-            mtime: UNIX_EPOCH,
-            ctime: UNIX_EPOCH,
-            crtime: UNIX_EPOCH,
-            kind,
-            perm,
-            nlink: if kind == FileType::Directory { 2 } else { 1 },
-            uid,
-            gid,
-            rdev: 0,
-            flags: 0,
-            blksize: 512,
+            ino, size, blocks: (size + 511) / 512,
+            atime: UNIX_EPOCH, mtime: UNIX_EPOCH, ctime: UNIX_EPOCH, crtime: UNIX_EPOCH,
+            kind, perm, nlink: if kind == FileType::Directory { 2 } else { 1 },
+            uid, gid, rdev: 0, flags: 0, blksize: 512,
         }
     }
 }
@@ -170,7 +189,6 @@ impl Filesystem for DnaVfs {
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         if parent != ROOT_INODE { reply.error(ENOENT); return; }
         let name_str = name.to_string_lossy().to_string();
-        
         if let Some(node) = self.nodes.values().find(|n| n.name == name_str) {
             reply.entry(&TTL, &self.generate_attr(node.ino, node.size, FileType::RegularFile, node.uid, node.gid, node.perm), 0);
         } else {
@@ -184,19 +202,10 @@ impl Filesystem for DnaVfs {
         self.next_ino += 1;
         
         let node = DnaNode {
-            ino,
-            name: name.to_string_lossy().to_string(),
-            size: 0,
-            content: Vec::new(),
-            uid: req.uid(),
-            gid: req.gid(),
-            perm: mode as u16,
+            ino, name: name.to_string_lossy().to_string(), size: 0, content: Vec::new(),
+            uid: req.uid(), gid: req.gid(), perm: mode as u16,
         };
-        
-        let uid = node.uid;
-        let gid = node.gid;
-        let perm = node.perm;
-
+        let uid = node.uid; let gid = node.gid; let perm = node.perm;
         self.nodes.insert(ino, node);
         reply.created(&TTL, &self.generate_attr(ino, 0, FileType::RegularFile, uid, gid, perm), 0, 0, 0);
     }
@@ -204,33 +213,37 @@ impl Filesystem for DnaVfs {
     fn write(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, data: &[u8], _write_flags: u32, _flags: i32, _lock_owner: Option<u64>, reply: ReplyWrite) {
         if let Some(node) = self.nodes.get_mut(&ino) {
             let offset = offset as usize;
-            if offset + data.len() > node.content.len() {
-                node.content.resize(offset + data.len(), 0);
-            }
+            if offset + data.len() > node.content.len() { node.content.resize(offset + data.len(), 0); }
             node.content[offset..offset + data.len()].copy_from_slice(data);
             node.size = node.content.len() as u64;
+            
+            if let Ok(mut m) = self.metrics.lock() { m.writes += 1; }
             reply.written(data.len() as u32);
         } else {
             reply.error(ENOENT);
         }
     }
 
-    // V8 FEATURE: Aerospace WAL + RAID 1 + Zstd + POSIX
     fn flush(&mut self, _req: &Request, ino: u64, _fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
         if let Some(node) = self.nodes.get(&ino) {
             if node.content.is_empty() { reply.ok(); return; }
 
-            println!("[+] FLUSH TRIGGERED: Processing {}...", node.name);
+            if let Ok(mut m) = self.metrics.lock() { 
+                m.log(format!("[FLUSH] Processing {}...", node.name)); 
+            }
             
-            // 1. Write-Ahead Log (WAL) Intent
             let wal_path = format!("{}/{}.wal", self.journal_dir, node.name);
             fs::write(&wal_path, b"STATUS: PENDING_SYNTHESIS").unwrap_or_default();
-            println!("    -> WAL: Journal entry locked.");
+            
+            if let Ok(mut m) = self.metrics.lock() { m.log(format!("  -> WAL: Journal entry locked.")); }
 
-            // 2. Zstd Compression
             let compressed_data = zstd::encode_all(node.content.as_slice(), 3).unwrap_or_else(|_| node.content.clone());
+            
+            if let Ok(mut m) = self.metrics.lock() {
+                m.raw_bytes += node.content.len() as u64;
+                m.compressed_bytes += compressed_data.len() as u64;
+            }
 
-            // 3. POSIX Metadata Injection
             let mut payload = Vec::new();
             payload.extend_from_slice(&node.uid.to_be_bytes());
             payload.extend_from_slice(&node.gid.to_be_bytes());
@@ -252,50 +265,42 @@ impl Filesystem for DnaVfs {
             }
             
             let fasta_data = pool.join("\n");
-
-            // 4. RAID 1 Mirroring (Dual Vault Write)
             let primary_path = format!("{}/{}.fasta", self.pool_dir, node.name);
             let mirror_path = format!("{}/{}.fasta", self.mirror_dir, node.name);
             
             fs::write(primary_path, &fasta_data).unwrap_or_default();
-            println!("    -> RAID 1: Written to Vault A (Primary).");
-            
             fs::write(mirror_path, &fasta_data).unwrap_or_default();
-            println!("    -> RAID 1: Written to Vault B (Mirror).");
-
-            // 5. Commit Journal
             fs::write(&wal_path, b"STATUS: COMMITTED").unwrap_or_default();
-            println!("    -> WAL: Synthesis committed successfully.");
+            
+            if let Ok(mut m) = self.metrics.lock() { 
+                m.log(format!("  -> RAID 1: Written to Vault A & Vault B.")); 
+                m.log(format!("  -> WAL: Synthesis committed successfully.")); 
+            }
         }
         reply.ok();
     }
 
-    // V8 FEATURE: RAID 1 Fail-Over + Zstd + POSIX
     fn open(&mut self, _req: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
         if let Some(node) = self.nodes.get_mut(&ino) {
             let primary_path = format!("{}/{}.fasta", self.pool_dir, node.name);
             let mirror_path = format!("{}/{}.fasta", self.mirror_dir, node.name);
-            
-            // Check WAL first
             let wal_path = format!("{}/{}.wal", self.journal_dir, node.name);
+            
             if let Ok(status) = fs::read_to_string(&wal_path) {
                 if status.contains("PENDING_SYNTHESIS") {
-                    eprintln!("[-] CRITICAL: WAL indicates corrupted synthesis. Quarantining file.");
-                    reply.error(ENOENT);
-                    return;
+                    if let Ok(mut m) = self.metrics.lock() { m.log(format!("[-] CRITICAL: WAL corrupted. Quarantining file.")); }
+                    reply.error(ENOENT); return;
                 }
             }
 
-            // RAID Fail-Over Logic
             let dna_pool = if let Ok(data) = fs::read_to_string(&primary_path) {
-                println!("[*] OPEN: Sequencing from Vault A...");
+                if let Ok(mut m) = self.metrics.lock() { m.log(format!("[*] OPEN: Sequencing from Vault A...")); }
                 data
             } else if let Ok(data) = fs::read_to_string(&mirror_path) {
-                eprintln!("[!] WARNING: Vault A failed. Failing over to Vault B (RAID 1)...");
+                if let Ok(mut m) = self.metrics.lock() { m.log(format!("[!] WARNING: Vault A failed. Failing over to Vault B...")); }
                 data
             } else {
-                reply.error(ENOENT);
-                return;
+                reply.error(ENOENT); return;
             };
 
             let primer = generate_primer(&node.name);
@@ -318,7 +323,7 @@ impl Filesystem for DnaVfs {
                 if let Some(chunk) = blocks.get(&i) { reassembled.extend_from_slice(chunk); }
             }
 
-            if reassembled.len() >= 14 { // 4(uid) + 4(gid) + 2(perm) + 4(checksum)
+            if reassembled.len() >= 14 { 
                 let mut idx = 0;
                 node.uid = u32::from_be_bytes([reassembled[idx], reassembled[idx+1], reassembled[idx+2], reassembled[idx+3]]); idx+=4;
                 node.gid = u32::from_be_bytes([reassembled[idx], reassembled[idx+1], reassembled[idx+2], reassembled[idx+3]]); idx+=4;
@@ -331,14 +336,11 @@ impl Filesystem for DnaVfs {
                     if let Ok(decompressed) = zstd::decode_all(compressed_data) {
                         node.content = decompressed;
                         node.size = node.content.len() as u64;
-                        println!("[+] SUCCESS: DNA Decoded, POSIX loaded, and Zstd Decompressed.");
-                    } else {
-                        eprintln!("[-] CRITICAL: Zstd Decompression Failed!");
+                        if let Ok(mut m) = self.metrics.lock() { m.log(format!("[+] SUCCESS: DNA Decoded, POSIX loaded & Decompressed.")); }
                     }
-                } else {
-                    eprintln!("[-] CRITICAL: Adler-32 Verification Failed!");
                 }
             }
+            if let Ok(mut m) = self.metrics.lock() { m.reads += 1; }
             reply.opened(0, 0);
         } else {
             reply.error(ENOENT);
@@ -347,59 +349,119 @@ impl Filesystem for DnaVfs {
 
     fn read(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, size: u32, _flags: i32, _lock_owner: Option<u64>, reply: ReplyData) {
         if let Some(node) = self.nodes.get(&ino) {
-            let offset = offset as usize;
-            let size = size as usize;
-            if offset >= node.content.len() {
-                reply.data(&[]);
-            } else {
+            let offset = offset as usize; let size = size as usize;
+            if offset >= node.content.len() { reply.data(&[]); } else {
                 let end = std::cmp::min(offset + size, node.content.len());
                 reply.data(&node.content[offset..end]);
             }
-        } else {
-            reply.error(ENOENT);
-        }
+        } else { reply.error(ENOENT); }
     }
 
     fn setattr(&mut self, _req: &Request, ino: u64, mode: Option<u32>, uid: Option<u32>, gid: Option<u32>, size: Option<u64>, _atime: Option<fuser::TimeOrNow>, _mtime: Option<fuser::TimeOrNow>, _ctime: Option<SystemTime>, _fh: Option<u64>, _crtime: Option<SystemTime>, _chgtime: Option<SystemTime>, _bkuptime: Option<SystemTime>, _flags: Option<u32>, reply: ReplyAttr) {
         let (final_size, final_uid, final_gid, final_perm) = if let Some(node) = self.nodes.get_mut(&ino) {
-            if let Some(s) = size {
-                node.size = s;
-                node.content.truncate(s as usize);
-            }
+            if let Some(s) = size { node.size = s; node.content.truncate(s as usize); }
             if let Some(m) = mode { node.perm = m as u16; }
             if let Some(u) = uid { node.uid = u; }
             if let Some(g) = gid { node.gid = g; }
-            
             (node.size, node.uid, node.gid, node.perm)
-        } else {
-            reply.error(ENOENT);
-            return;
-        };
+        } else { reply.error(ENOENT); return; };
 
         reply.attr(&TTL, &self.generate_attr(ino, final_size, FileType::RegularFile, final_uid, final_gid, final_perm));
     }
 }
 
-fn main() {
+// ==========================================
+// 🖥️ THE OBSERVABILITY DASHBOARD (TUI)
+// ==========================================
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         eprintln!("Usage: {} <mountpoint>", args[0]);
-        return;
+        return Ok(());
     }
-    let mountpoint = &args[1];
+    let mountpoint = args[1].clone();
     
     let home = env::var("HOME").unwrap_or_else(|_| "/root".to_string());
     let pool_dir = format!("{}/dna-posix/dna_vfs/.dna_cache/physical_pool", home);
     let mirror_dir = format!("{}/dna-posix/dna_vfs/.dna_cache/vault_b", home);
     let journal_dir = format!("{}/dna-posix/dna_vfs/.dna_cache/journal", home);
 
-    println!("[*] Booting TheSNMC DNA-POSIX V8 Engine (Native Rust)");
-    println!("[*] Primary Vault (TMPFS): {}", pool_dir);
-    println!("[*] RAID 1 Mirror (TMPFS): {}", mirror_dir);
-    println!("[*] Mounting pure-metal FUSE driver at: {}", mountpoint);
+    // Initialize Shared Memory
+    let metrics = Arc::new(Mutex::new(EngineMetrics {
+        raw_bytes: 0, compressed_bytes: 0, reads: 0, writes: 0,
+        logs: vec!["[*] System Booting...".to_string(), "[*] Securing RAM Disks...".to_string(), "[*] Engine Online.".to_string()],
+    }));
 
-    let vfs = DnaVfs::new(pool_dir, mirror_dir, journal_dir);
+    let vfs = DnaVfs::new(pool_dir, mirror_dir, journal_dir, Arc::clone(&metrics));
     let options = vec![MountOption::RW, MountOption::FSName("dna_vfs".to_string()), MountOption::AutoUnmount];
 
-    fuser::mount2(vfs, mountpoint, &options).expect("[-] FATAL: Kernel rejected the FUSE mount.");
+    // Spawning FUSE to Background Thread
+    let _session = fuser::spawn_mount2(vfs, &mountpoint, &options).expect("[-] FATAL: Kernel rejected mount.");
+
+    // TUI Initialization
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    loop {
+        terminal.draw(|f| {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .margin(1)
+                .constraints([Constraint::Length(3), Constraint::Min(10), Constraint::Length(3)].as_ref())
+                .split(f.size());
+
+            let m = metrics.lock().unwrap();
+
+            // TOP: Title
+            let title = Paragraph::new(format!("  TheSNMC DNA-POSIX V8 Enterprise Core  |  Live Mount: {}  ", mountpoint))
+                .style(Style::default().fg(Color::Cyan))
+                .block(Block::default().borders(Borders::ALL));
+            f.render_widget(title, chunks[0]);
+
+            // MIDDLE: Dashboard Split
+            let middle_chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(60), Constraint::Percentage(40)].as_ref())
+                .split(chunks[1]);
+
+            // MIDDLE-LEFT: Live Logs
+            let log_items: Vec<ListItem> = m.logs.iter().map(|l| ListItem::new(l.as_str())).collect();
+            let logs = List::new(log_items).block(Block::default().title(" System Events (FUSE Intercepts) ").borders(Borders::ALL));
+            f.render_widget(logs, middle_chunks[0]);
+
+            // MIDDLE-RIGHT: Analytics
+            let ratio = if m.raw_bytes > 0 { 100.0 - ((m.compressed_bytes as f64 / m.raw_bytes as f64) * 100.0) } else { 0.0 };
+            let stats = format!(
+                "\n\n  STORAGE ECONOMICS\n  ------------------\n  Raw Payload:    {} bytes\n  DNA Pool Size:  {} bytes\n  Zstd Saved:     {:.2}%\n\n  ENGINE ACTIVITY\n  ------------------\n  Kernel Writes:  {}\n  Kernel Reads:   {}",
+                m.raw_bytes, m.compressed_bytes, ratio, m.writes, m.reads
+            );
+            let analytics = Paragraph::new(stats).block(Block::default().title(" Live Analytics ").borders(Borders::ALL));
+            f.render_widget(analytics, middle_chunks[1]);
+
+            // BOTTOM: Controls
+            let footer = Paragraph::new(" Press 'q' to gracefully unmount and exit engine. ")
+                .style(Style::default().fg(Color::DarkGray))
+                .block(Block::default().borders(Borders::ALL));
+            f.render_widget(footer, chunks[2]);
+        })?;
+
+        // Handle Keyboard Exit
+        if event::poll(Duration::from_millis(100))? {
+            if let Event::Key(key) = event::read()? {
+                if let KeyCode::Char('q') = key.code { break; }
+            }
+        }
+    }
+
+    // TUI Teardown
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+    
+    println!("[+] Gracefully unmounted FUSE bridge and destroyed UI session.");
+    Ok(())
 }
