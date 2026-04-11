@@ -84,6 +84,10 @@ fn decode_oligo(primer: &str, dna: &str) -> Vec<u8> {
 // 🚀 THE KERNEL BRIDGE (FUSE VFS)
 // ==========================================
 
+// ==========================================
+// 🚀 THE KERNEL BRIDGE (FUSE VFS)
+// ==========================================
+
 const TTL: Duration = Duration::from_secs(1);
 const ROOT_INODE: u64 = 1;
 
@@ -101,15 +105,19 @@ struct DnaNode {
 struct DnaVfs {
     nodes: HashMap<u64, DnaNode>,
     next_ino: u64,
-    pool_dir: String,
+    pool_dir: String,      // Vault A
+    mirror_dir: String,    // Vault B (RAID 1)
+    journal_dir: String,   // WAL Journal
 }
 
 impl DnaVfs {
-    fn new(pool_dir: String) -> Self {
+    fn new(pool_dir: String, mirror_dir: String, journal_dir: String) -> Self {
         Self {
             nodes: HashMap::new(),
             next_ino: 2,
             pool_dir,
+            mirror_dir,
+            journal_dir,
         }
     }
 
@@ -207,24 +215,27 @@ impl Filesystem for DnaVfs {
         }
     }
 
-    // V8 FEATURE: Zstd Compression + POSIX Metadata Encoding
+    // V8 FEATURE: Aerospace WAL + RAID 1 + Zstd + POSIX
     fn flush(&mut self, _req: &Request, ino: u64, _fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
         if let Some(node) = self.nodes.get(&ino) {
             if node.content.is_empty() { reply.ok(); return; }
 
-            println!("[+] FLUSH TRIGGERED: Compressing & Encoding {}...", node.name);
+            println!("[+] FLUSH TRIGGERED: Processing {}...", node.name);
             
-            // 1. Zstd Compression
-            let compressed_data = zstd::encode_all(node.content.as_slice(), 3).unwrap_or_else(|_| node.content.clone());
-            println!("    -> Compression Ratio: {} bytes -> {} bytes", node.content.len(), compressed_data.len());
+            // 1. Write-Ahead Log (WAL) Intent
+            let wal_path = format!("{}/{}.wal", self.journal_dir, node.name);
+            fs::write(&wal_path, b"STATUS: PENDING_SYNTHESIS").unwrap_or_default();
+            println!("    -> WAL: Journal entry locked.");
 
-            // 2. POSIX Metadata Injection
+            // 2. Zstd Compression
+            let compressed_data = zstd::encode_all(node.content.as_slice(), 3).unwrap_or_else(|_| node.content.clone());
+
+            // 3. POSIX Metadata Injection
             let mut payload = Vec::new();
             payload.extend_from_slice(&node.uid.to_be_bytes());
             payload.extend_from_slice(&node.gid.to_be_bytes());
             payload.extend_from_slice(&node.perm.to_be_bytes());
             
-            // 3. Checksum & Data
             let checksum = compute_checksum(&compressed_data);
             payload.extend_from_slice(&checksum.to_be_bytes());
             payload.extend_from_slice(&compressed_data);
@@ -240,59 +251,92 @@ impl Filesystem for DnaVfs {
                 pool.push(encode_oligo(&primer, &block));
             }
             
-            let fasta_path = format!("{}/{}.fasta", self.pool_dir, node.name);
-            fs::write(fasta_path, pool.join("\n")).unwrap_or_default();
-            println!("[+] SUCCESS: DNA Pool written to TMPFS.");
+            let fasta_data = pool.join("\n");
+
+            // 4. RAID 1 Mirroring (Dual Vault Write)
+            let primary_path = format!("{}/{}.fasta", self.pool_dir, node.name);
+            let mirror_path = format!("{}/{}.fasta", self.mirror_dir, node.name);
+            
+            fs::write(primary_path, &fasta_data).unwrap_or_default();
+            println!("    -> RAID 1: Written to Vault A (Primary).");
+            
+            fs::write(mirror_path, &fasta_data).unwrap_or_default();
+            println!("    -> RAID 1: Written to Vault B (Mirror).");
+
+            // 5. Commit Journal
+            fs::write(&wal_path, b"STATUS: COMMITTED").unwrap_or_default();
+            println!("    -> WAL: Synthesis committed successfully.");
         }
         reply.ok();
     }
 
-    // V8 FEATURE: Zstd Decompression + POSIX Metadata Decoding
+    // V8 FEATURE: RAID 1 Fail-Over + Zstd + POSIX
     fn open(&mut self, _req: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
         if let Some(node) = self.nodes.get_mut(&ino) {
-            let fasta_path = format!("{}/{}.fasta", self.pool_dir, node.name);
-            if let Ok(dna_pool) = fs::read_to_string(&fasta_path) {
-                println!("[*] OPEN TRIGGERED: Sequencing {} from DNA...", node.name);
-                let primer = generate_primer(&node.name);
-                let mut blocks: HashMap<u16, Vec<u8>> = HashMap::new();
-                let mut max_index = 0;
+            let primary_path = format!("{}/{}.fasta", self.pool_dir, node.name);
+            let mirror_path = format!("{}/{}.fasta", self.mirror_dir, node.name);
+            
+            // Check WAL first
+            let wal_path = format!("{}/{}.wal", self.journal_dir, node.name);
+            if let Ok(status) = fs::read_to_string(&wal_path) {
+                if status.contains("PENDING_SYNTHESIS") {
+                    eprintln!("[-] CRITICAL: WAL indicates corrupted synthesis. Quarantining file.");
+                    reply.error(ENOENT);
+                    return;
+                }
+            }
 
-                for strand in dna_pool.lines() {
-                    if strand.starts_with(&primer) {
-                        let healed_block = decode_oligo(&primer, strand);
-                        if healed_block.len() >= 2 {
-                            let index = u16::from_be_bytes([healed_block[0], healed_block[1]]);
-                            blocks.insert(index, healed_block[2..].to_vec());
-                            if index > max_index { max_index = index; }
-                        }
+            // RAID Fail-Over Logic
+            let dna_pool = if let Ok(data) = fs::read_to_string(&primary_path) {
+                println!("[*] OPEN: Sequencing from Vault A...");
+                data
+            } else if let Ok(data) = fs::read_to_string(&mirror_path) {
+                eprintln!("[!] WARNING: Vault A failed. Failing over to Vault B (RAID 1)...");
+                data
+            } else {
+                reply.error(ENOENT);
+                return;
+            };
+
+            let primer = generate_primer(&node.name);
+            let mut blocks: HashMap<u16, Vec<u8>> = HashMap::new();
+            let mut max_index = 0;
+
+            for strand in dna_pool.lines() {
+                if strand.starts_with(&primer) {
+                    let healed_block = decode_oligo(&primer, strand);
+                    if healed_block.len() >= 2 {
+                        let index = u16::from_be_bytes([healed_block[0], healed_block[1]]);
+                        blocks.insert(index, healed_block[2..].to_vec());
+                        if index > max_index { max_index = index; }
                     }
                 }
+            }
 
-                let mut reassembled = Vec::new();
-                for i in 0..=max_index {
-                    if let Some(chunk) = blocks.get(&i) { reassembled.extend_from_slice(chunk); }
-                }
+            let mut reassembled = Vec::new();
+            for i in 0..=max_index {
+                if let Some(chunk) = blocks.get(&i) { reassembled.extend_from_slice(chunk); }
+            }
 
-                if reassembled.len() >= 14 { // 4(uid) + 4(gid) + 2(perm) + 4(checksum)
-                    let mut idx = 0;
-                    node.uid = u32::from_be_bytes([reassembled[idx], reassembled[idx+1], reassembled[idx+2], reassembled[idx+3]]); idx+=4;
-                    node.gid = u32::from_be_bytes([reassembled[idx], reassembled[idx+1], reassembled[idx+2], reassembled[idx+3]]); idx+=4;
-                    node.perm = u16::from_be_bytes([reassembled[idx], reassembled[idx+1]]); idx+=2;
-                    
-                    let expected_chk = u32::from_be_bytes([reassembled[idx], reassembled[idx+1], reassembled[idx+2], reassembled[idx+3]]); idx+=4;
-                    let compressed_data = &reassembled[idx..];
+            if reassembled.len() >= 14 { // 4(uid) + 4(gid) + 2(perm) + 4(checksum)
+                let mut idx = 0;
+                node.uid = u32::from_be_bytes([reassembled[idx], reassembled[idx+1], reassembled[idx+2], reassembled[idx+3]]); idx+=4;
+                node.gid = u32::from_be_bytes([reassembled[idx], reassembled[idx+1], reassembled[idx+2], reassembled[idx+3]]); idx+=4;
+                node.perm = u16::from_be_bytes([reassembled[idx], reassembled[idx+1]]); idx+=2;
+                
+                let expected_chk = u32::from_be_bytes([reassembled[idx], reassembled[idx+1], reassembled[idx+2], reassembled[idx+3]]); idx+=4;
+                let compressed_data = &reassembled[idx..];
 
-                    if compute_checksum(compressed_data) == expected_chk {
-                        if let Ok(decompressed) = zstd::decode_all(compressed_data) {
-                            node.content = decompressed;
-                            node.size = node.content.len() as u64;
-                            println!("[+] SUCCESS: DNA Decoded, POSIX loaded, and Zstd Decompressed.");
-                        } else {
-                            eprintln!("[-] CRITICAL: Zstd Decompression Failed!");
-                        }
+                if compute_checksum(compressed_data) == expected_chk {
+                    if let Ok(decompressed) = zstd::decode_all(compressed_data) {
+                        node.content = decompressed;
+                        node.size = node.content.len() as u64;
+                        println!("[+] SUCCESS: DNA Decoded, POSIX loaded, and Zstd Decompressed.");
                     } else {
-                        eprintln!("[-] CRITICAL: Adler-32 Verification Failed!");
+                        eprintln!("[-] CRITICAL: Zstd Decompression Failed!");
                     }
+                } else {
+                    eprintln!("[-] CRITICAL: Adler-32 Verification Failed!");
                 }
             }
             reply.opened(0, 0);
@@ -346,12 +390,15 @@ fn main() {
     
     let home = env::var("HOME").unwrap_or_else(|_| "/root".to_string());
     let pool_dir = format!("{}/dna-posix/dna_vfs/.dna_cache/physical_pool", home);
+    let mirror_dir = format!("{}/dna-posix/dna_vfs/.dna_cache/vault_b", home);
+    let journal_dir = format!("{}/dna-posix/dna_vfs/.dna_cache/journal", home);
 
     println!("[*] Booting TheSNMC DNA-POSIX V8 Engine (Native Rust)");
-    println!("[*] Physical Backing Pool (TMPFS): {}", pool_dir);
+    println!("[*] Primary Vault (TMPFS): {}", pool_dir);
+    println!("[*] RAID 1 Mirror (TMPFS): {}", mirror_dir);
     println!("[*] Mounting pure-metal FUSE driver at: {}", mountpoint);
 
-    let vfs = DnaVfs::new(pool_dir);
+    let vfs = DnaVfs::new(pool_dir, mirror_dir, journal_dir);
     let options = vec![MountOption::RW, MountOption::FSName("dna_vfs".to_string()), MountOption::AutoUnmount];
 
     fuser::mount2(vfs, mountpoint, &options).expect("[-] FATAL: Kernel rejected the FUSE mount.");
