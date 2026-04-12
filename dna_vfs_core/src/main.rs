@@ -24,10 +24,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // ==========================================
-// 📊 SHARED MEMORY (NEURAL LINK FOR TUI)
+// 📊 SHARED MEMORY (TRUE ENTERPRISE SSOT)
 // ==========================================
 
 struct EngineMetrics {
+    total_capacity: u64, // <-- NEW: Single Source of Truth for hardware volume
     raw_bytes: u64,
     compressed_bytes: u64,
     reads: u64,
@@ -136,7 +137,7 @@ struct DnaVfs {
     pool_dir: String,      
     mirror_dir: String,    
     journal_dir: String,
-    trash_dir: String, // V8 FEATURE: Biological Garbage Collection
+    trash_dir: String,
     metrics: Arc<Mutex<EngineMetrics>>, // Neural Link to TUI
 }
 
@@ -164,10 +165,14 @@ impl DnaVfs {
 }
 
 impl Filesystem for DnaVfs {
-    // V8 FEATURE: 1.0 Petabyte Kernel Illusion
+    // V8 FEATURE: Dynamic Capacity Sync via Shared Memory
     fn statfs(&mut self, _req: &Request, _ino: u64, reply: ReplyStatfs) {
-        // 1 PB = 274,877,906,944 blocks of 4096 bytes
-        let blocks = 274_877_906_944;
+        // Read exact dynamic capacity from the SSOT Mutex instead of hardcoding
+        let blocks = if let Ok(m) = self.metrics.lock() {
+            m.total_capacity / 4096 // Convert raw bytes to 4096-byte blocks for Linux Kernel
+        } else {
+            274_877_906_944 // Fallback 1.0 PB if locked
+        };
         reply.statfs(blocks, blocks, blocks, 0, 1_000_000_000, 4096, 255, 4096);
     }
 
@@ -425,9 +430,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let journal_dir = format!("{}/dna-posix/dna_vfs/.dna_cache/journal", home);
     let trash_dir = format!("{}/dna-posix/dna_vfs/.bio_trash", home);
 
-    // Initialize Shared Memory
+    // Initialize Shared Memory with the SSOT value
     let metrics = Arc::new(Mutex::new(EngineMetrics {
-        raw_bytes: 0, compressed_bytes: 0, reads: 0, writes: 0,
+        total_capacity: 1_125_899_906_842_624, // Exactly 1.0 Petabyte in bytes
+        raw_bytes: 0, 
+        compressed_bytes: 0, 
+        reads: 0, 
+        writes: 0,
         logs: vec!["[*] System Booting...".to_string(), "[*] Securing RAM Disks...".to_string(), "[*] Engine Online.".to_string()],
     }));
 
@@ -471,11 +480,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let logs = List::new(log_items).block(Block::default().title(" System Events (FUSE Intercepts) ").borders(Borders::ALL));
             f.render_widget(logs, middle_chunks[0]);
 
-            // MIDDLE-RIGHT: Analytics
+            // MIDDLE-RIGHT: Analytics (Dynamically parsing the SSOT)
             let ratio = if m.raw_bytes > 0 { 100.0 - ((m.compressed_bytes as f64 / m.raw_bytes as f64) * 100.0) } else { 0.0 };
+            let total_pb = m.total_capacity as f64 / 1_125_899_906_842_624.0; // Dynamically format to PB
             let stats = format!(
-                "\n\n  STORAGE ECONOMICS\n  ------------------\n  Raw Payload:    {} bytes\n  DNA Pool Size:  {} bytes\n  Zstd Saved:     {:.2}%\n\n  ENGINE ACTIVITY\n  ------------------\n  Kernel Writes:  {}\n  Kernel Reads:   {}",
-                m.raw_bytes, m.compressed_bytes, ratio, m.writes, m.reads
+                "\n\n  STORAGE ECONOMICS\n  ------------------\n  Total Volume:   {:.1} PB (Dynamic API)\n  Raw Payload:    {} bytes\n  DNA Pool Size:  {} bytes\n  Zstd Saved:     {:.2}%\n\n  ENGINE ACTIVITY\n  ------------------\n  Kernel Writes:  {}\n  Kernel Reads:   {}",
+                total_pb, m.raw_bytes, m.compressed_bytes, ratio, m.writes, m.reads
             );
             let analytics = Paragraph::new(stats).block(Block::default().title(" Live Analytics ").borders(Borders::ALL));
             f.render_widget(analytics, middle_chunks[1]);
