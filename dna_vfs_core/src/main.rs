@@ -5,7 +5,7 @@ use crossterm::{
 };
 use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
-    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
+    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request,
 };
 use libc::ENOENT;
 use ratatui::{
@@ -135,18 +135,20 @@ struct DnaVfs {
     next_ino: u64,
     pool_dir: String,      
     mirror_dir: String,    
-    journal_dir: String,   
+    journal_dir: String,
+    trash_dir: String, // V8 FEATURE: Biological Garbage Collection
     metrics: Arc<Mutex<EngineMetrics>>, // Neural Link to TUI
 }
 
 impl DnaVfs {
-    fn new(pool_dir: String, mirror_dir: String, journal_dir: String, metrics: Arc<Mutex<EngineMetrics>>) -> Self {
+    fn new(pool_dir: String, mirror_dir: String, journal_dir: String, trash_dir: String, metrics: Arc<Mutex<EngineMetrics>>) -> Self {
         Self {
             nodes: HashMap::new(),
             next_ino: 2,
             pool_dir,
             mirror_dir,
             journal_dir,
+            trash_dir,
             metrics,
         }
     }
@@ -162,6 +164,13 @@ impl DnaVfs {
 }
 
 impl Filesystem for DnaVfs {
+    // V8 FEATURE: 1.0 Petabyte Kernel Illusion
+    fn statfs(&mut self, _req: &Request, _ino: u64, reply: ReplyStatfs) {
+        // 1 PB = 274,877,906,944 blocks of 4096 bytes
+        let blocks = 274_877_906_944;
+        reply.statfs(blocks, blocks, blocks, 0, 1_000_000_000, 4096, 255, 4096);
+    }
+
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
         if ino == ROOT_INODE {
             reply.attr(&TTL, &self.generate_attr(ino, 0, FileType::Directory, 1000, 1000, 0o755));
@@ -208,6 +217,34 @@ impl Filesystem for DnaVfs {
         let uid = node.uid; let gid = node.gid; let perm = node.perm;
         self.nodes.insert(ino, node);
         reply.created(&TTL, &self.generate_attr(ino, 0, FileType::RegularFile, uid, gid, perm), 0, 0, 0);
+    }
+
+    // V8 FEATURE: Biological Garbage Collection
+    fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        if parent != ROOT_INODE { reply.error(ENOENT); return; }
+        let name_str = name.to_string_lossy().to_string();
+
+        let ino_to_remove = self.nodes.values().find(|n| n.name == name_str).map(|n| n.ino);
+
+        if let Some(ino) = ino_to_remove {
+            self.nodes.remove(&ino);
+            
+            // Move fasta files to the quarantine zone instead of destroying them
+            let primary_path = format!("{}/{}.fasta", self.pool_dir, name_str);
+            let mirror_path = format!("{}/{}.fasta", self.mirror_dir, name_str);
+            let trash_primary = format!("{}/{}_vaultA.fasta", self.trash_dir, name_str);
+            let trash_mirror = format!("{}/{}_vaultB.fasta", self.trash_dir, name_str);
+            
+            let _ = fs::rename(&primary_path, &trash_primary);
+            let _ = fs::rename(&mirror_path, &trash_mirror);
+
+            if let Ok(mut m) = self.metrics.lock() { 
+                m.log(format!("[🗑️ GC] {} quarantined to .bio_trash", name_str)); 
+            }
+            reply.ok();
+        } else {
+            reply.error(ENOENT);
+        }
     }
 
     fn write(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, data: &[u8], _write_flags: u32, _flags: i32, _lock_owner: Option<u64>, reply: ReplyWrite) {
@@ -386,6 +423,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pool_dir = format!("{}/dna-posix/dna_vfs/.dna_cache/physical_pool", home);
     let mirror_dir = format!("{}/dna-posix/dna_vfs/.dna_cache/vault_b", home);
     let journal_dir = format!("{}/dna-posix/dna_vfs/.dna_cache/journal", home);
+    let trash_dir = format!("{}/dna-posix/dna_vfs/.bio_trash", home);
 
     // Initialize Shared Memory
     let metrics = Arc::new(Mutex::new(EngineMetrics {
@@ -393,7 +431,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         logs: vec!["[*] System Booting...".to_string(), "[*] Securing RAM Disks...".to_string(), "[*] Engine Online.".to_string()],
     }));
 
-    let vfs = DnaVfs::new(pool_dir, mirror_dir, journal_dir, Arc::clone(&metrics));
+    let vfs = DnaVfs::new(pool_dir, mirror_dir, journal_dir, trash_dir, Arc::clone(&metrics));
     let options = vec![MountOption::RW, MountOption::FSName("dna_vfs".to_string()), MountOption::AutoUnmount];
 
     // Spawning FUSE to Background Thread
