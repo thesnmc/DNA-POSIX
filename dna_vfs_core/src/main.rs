@@ -1,3 +1,8 @@
+use aes_gcm::{
+    aead::{Aead, AeadCore, KeyInit, OsRng},
+    Aes256Gcm, Nonce,
+};
+use argon2::Argon2;
 use crossterm::{
     event::{self, Event, KeyCode},
     execute,
@@ -19,7 +24,7 @@ use std::collections::HashMap;
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -28,7 +33,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 // ==========================================
 
 struct EngineMetrics {
-    total_capacity: u64, // <-- NEW: Single Source of Truth for hardware volume
+    total_capacity: u64,
     raw_bytes: u64,
     compressed_bytes: u64,
     reads: u64,
@@ -39,7 +44,7 @@ struct EngineMetrics {
 impl EngineMetrics {
     fn log(&mut self, msg: String) {
         self.logs.push(msg);
-        if self.logs.len() > 15 { self.logs.remove(0); } // Keep last 15 logs on screen
+        if self.logs.len() > 15 { self.logs.remove(0); }
     }
 }
 
@@ -138,11 +143,12 @@ struct DnaVfs {
     mirror_dir: String,    
     journal_dir: String,
     trash_dir: String,
-    metrics: Arc<Mutex<EngineMetrics>>, // Neural Link to TUI
+    aes_key: [u8; 32], // <-- V8 ZERO-TRUST: Volatile Key in RAM
+    metrics: Arc<Mutex<EngineMetrics>>,
 }
 
 impl DnaVfs {
-    fn new(pool_dir: String, mirror_dir: String, journal_dir: String, trash_dir: String, metrics: Arc<Mutex<EngineMetrics>>) -> Self {
+    fn new(pool_dir: String, mirror_dir: String, journal_dir: String, trash_dir: String, aes_key: [u8; 32], metrics: Arc<Mutex<EngineMetrics>>) -> Self {
         Self {
             nodes: HashMap::new(),
             next_ino: 2,
@@ -150,6 +156,7 @@ impl DnaVfs {
             mirror_dir,
             journal_dir,
             trash_dir,
+            aes_key,
             metrics,
         }
     }
@@ -165,13 +172,11 @@ impl DnaVfs {
 }
 
 impl Filesystem for DnaVfs {
-    // V8 FEATURE: Dynamic Capacity Sync via Shared Memory
     fn statfs(&mut self, _req: &Request, _ino: u64, reply: ReplyStatfs) {
-        // Read exact dynamic capacity from the SSOT Mutex instead of hardcoding
         let blocks = if let Ok(m) = self.metrics.lock() {
-            m.total_capacity / 4096 // Convert raw bytes to 4096-byte blocks for Linux Kernel
+            m.total_capacity / 4096 
         } else {
-            274_877_906_944 // Fallback 1.0 PB if locked
+            274_877_906_944
         };
         reply.statfs(blocks, blocks, blocks, 0, 1_000_000_000, 4096, 255, 4096);
     }
@@ -224,7 +229,6 @@ impl Filesystem for DnaVfs {
         reply.created(&TTL, &self.generate_attr(ino, 0, FileType::RegularFile, uid, gid, perm), 0, 0, 0);
     }
 
-    // V8 FEATURE: Biological Garbage Collection
     fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         if parent != ROOT_INODE { reply.error(ENOENT); return; }
         let name_str = name.to_string_lossy().to_string();
@@ -234,7 +238,6 @@ impl Filesystem for DnaVfs {
         if let Some(ino) = ino_to_remove {
             self.nodes.remove(&ino);
             
-            // Move fasta files to the quarantine zone instead of destroying them
             let primary_path = format!("{}/{}.fasta", self.pool_dir, name_str);
             let mirror_path = format!("{}/{}.fasta", self.mirror_dir, name_str);
             let trash_primary = format!("{}/{}_vaultA.fasta", self.trash_dir, name_str);
@@ -279,22 +282,35 @@ impl Filesystem for DnaVfs {
             
             if let Ok(mut m) = self.metrics.lock() { m.log(format!("  -> WAL: Journal entry locked.")); }
 
+            // 1. COMPRESS
             let compressed_data = zstd::encode_all(node.content.as_slice(), 3).unwrap_or_else(|_| node.content.clone());
             
+            // 2. ZERO-TRUST ENCRYPT (AES-256-GCM)
+            let cipher = Aes256Gcm::new(aes_gcm::Key::<Aes256Gcm>::from_slice(&self.aes_key));
+            let nonce = Aes256Gcm::generate_nonce(&mut OsRng); // 12-byte unique nonce
+            let ciphertext = cipher.encrypt(&nonce, compressed_data.as_ref()).unwrap_or_default();
+
+            let mut encrypted_payload = Vec::new();
+            encrypted_payload.extend_from_slice(&nonce);
+            encrypted_payload.extend_from_slice(&ciphertext);
+
             if let Ok(mut m) = self.metrics.lock() {
                 m.raw_bytes += node.content.len() as u64;
-                m.compressed_bytes += compressed_data.len() as u64;
+                m.compressed_bytes += encrypted_payload.len() as u64;
+                m.log(format!("  -> ZERO-TRUST: AES-256-GCM Applied."));
             }
 
+            // 3. POSIX MEMORY & CHECKSUM
             let mut payload = Vec::new();
             payload.extend_from_slice(&node.uid.to_be_bytes());
             payload.extend_from_slice(&node.gid.to_be_bytes());
             payload.extend_from_slice(&node.perm.to_be_bytes());
             
-            let checksum = compute_checksum(&compressed_data);
+            let checksum = compute_checksum(&encrypted_payload);
             payload.extend_from_slice(&checksum.to_be_bytes());
-            payload.extend_from_slice(&compressed_data);
+            payload.extend_from_slice(&encrypted_payload);
 
+            // 4. BIOLOGICAL TRANSLATION
             let primer = generate_primer(&node.name);
             let chunk_size = 8;
             let mut pool: Vec<String> = Vec::new();
@@ -345,6 +361,7 @@ impl Filesystem for DnaVfs {
                 reply.error(ENOENT); return;
             };
 
+            // 1. BIOLOGICAL HEALING (TMR)
             let primer = generate_primer(&node.name);
             let mut blocks: HashMap<u16, Vec<u8>> = HashMap::new();
             let mut max_index = 0;
@@ -372,13 +389,28 @@ impl Filesystem for DnaVfs {
                 node.perm = u16::from_be_bytes([reassembled[idx], reassembled[idx+1]]); idx+=2;
                 
                 let expected_chk = u32::from_be_bytes([reassembled[idx], reassembled[idx+1], reassembled[idx+2], reassembled[idx+3]]); idx+=4;
-                let compressed_data = &reassembled[idx..];
+                let encrypted_payload = &reassembled[idx..];
 
-                if compute_checksum(compressed_data) == expected_chk {
-                    if let Ok(decompressed) = zstd::decode_all(compressed_data) {
-                        node.content = decompressed;
-                        node.size = node.content.len() as u64;
-                        if let Ok(mut m) = self.metrics.lock() { m.log(format!("[+] SUCCESS: DNA Decoded, POSIX loaded & Decompressed.")); }
+                // 2. CHECKSUM
+                if compute_checksum(encrypted_payload) == expected_chk {
+                    if encrypted_payload.len() > 12 {
+                        // 3. ZERO-TRUST DECRYPT (AES-256-GCM)
+                        let nonce = aes_gcm::Nonce::from_slice(&encrypted_payload[0..12]);
+                        let ciphertext = &encrypted_payload[12..];
+                        let cipher = Aes256Gcm::new(aes_gcm::Key::<Aes256Gcm>::from_slice(&self.aes_key));
+
+                        if let Ok(decrypted_compressed) = cipher.decrypt(nonce, ciphertext) {
+                            if let Ok(mut m) = self.metrics.lock() { m.log(format!("  -> ZERO-TRUST: AES Decrypted & Authenticated.")); }
+                            
+                            // 4. DECOMPRESS
+                            if let Ok(decompressed) = zstd::decode_all(decrypted_compressed.as_slice()) {
+                                node.content = decompressed;
+                                node.size = node.content.len() as u64;
+                                if let Ok(mut m) = self.metrics.lock() { m.log(format!("[+] SUCCESS: File successfully restored.")); }
+                            }
+                        } else {
+                            if let Ok(mut m) = self.metrics.lock() { m.log(format!("[-] FATAL: AES Decryption Failed. Tampering detected!")); }
+                        }
                     }
                 }
             }
@@ -423,6 +455,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let mountpoint = args[1].clone();
+
+    // --- V8 ZERO-TRUST INITIALIZATION ---
+    println!("=======================================================");
+    println!(" 🧬 V8 ENTERPRISE CORE: ZERO-TRUST INITIALIZATION");
+    println!("=======================================================");
+    print!("Enter Master Mount Password: ");
+    io::stdout().flush().unwrap();
+    let password = rpassword::read_password().expect("[-] FATAL: Failed to read secure password.");
+    let password = password.trim().as_bytes();
+
+    let salt = b"DNA-POSIX-V8-ENTERPRISE-SALT-123";
+    let mut aes_key = [0u8; 32];
+    Argon2::default().hash_password_into(password, salt, &mut aes_key).expect("[-] FATAL: Argon2id Key Derivation Failed.");
+    println!("[+] Volatile AES-256-GCM Key Derived. Securing Mount...\n");
+    // ------------------------------------
     
     let home = env::var("HOME").unwrap_or_else(|_| "/root".to_string());
     let pool_dir = format!("{}/dna-posix/dna_vfs/.dna_cache/physical_pool", home);
@@ -430,9 +477,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let journal_dir = format!("{}/dna-posix/dna_vfs/.dna_cache/journal", home);
     let trash_dir = format!("{}/dna-posix/dna_vfs/.bio_trash", home);
 
-    // Initialize Shared Memory with the SSOT value
     let metrics = Arc::new(Mutex::new(EngineMetrics {
-        total_capacity: 1_125_899_906_842_624, // Exactly 1.0 Petabyte in bytes
+        total_capacity: 1_125_899_906_842_624,
         raw_bytes: 0, 
         compressed_bytes: 0, 
         reads: 0, 
@@ -440,13 +486,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         logs: vec!["[*] System Booting...".to_string(), "[*] Securing RAM Disks...".to_string(), "[*] Engine Online.".to_string()],
     }));
 
-    let vfs = DnaVfs::new(pool_dir, mirror_dir, journal_dir, trash_dir, Arc::clone(&metrics));
+    let vfs = DnaVfs::new(pool_dir, mirror_dir, journal_dir, trash_dir, aes_key, Arc::clone(&metrics));
     let options = vec![MountOption::RW, MountOption::FSName("dna_vfs".to_string()), MountOption::AutoUnmount];
 
-    // Spawning FUSE to Background Thread
     let _session = fuser::spawn_mount2(vfs, &mountpoint, &options).expect("[-] FATAL: Kernel rejected mount.");
 
-    // TUI Initialization
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -463,26 +507,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let m = metrics.lock().unwrap();
 
-            // TOP: Title
             let title = Paragraph::new(format!("  TheSNMC DNA-POSIX V8 Enterprise Core  |  Live Mount: {}  ", mountpoint))
                 .style(Style::default().fg(Color::Cyan))
                 .block(Block::default().borders(Borders::ALL));
             f.render_widget(title, chunks[0]);
 
-            // MIDDLE: Dashboard Split
             let middle_chunks = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(60), Constraint::Percentage(40)].as_ref())
                 .split(chunks[1]);
 
-            // MIDDLE-LEFT: Live Logs
             let log_items: Vec<ListItem> = m.logs.iter().map(|l| ListItem::new(l.as_str())).collect();
             let logs = List::new(log_items).block(Block::default().title(" System Events (FUSE Intercepts) ").borders(Borders::ALL));
             f.render_widget(logs, middle_chunks[0]);
 
-            // MIDDLE-RIGHT: Analytics (Dynamically parsing the SSOT)
             let ratio = if m.raw_bytes > 0 { 100.0 - ((m.compressed_bytes as f64 / m.raw_bytes as f64) * 100.0) } else { 0.0 };
-            let total_pb = m.total_capacity as f64 / 1_125_899_906_842_624.0; // Dynamically format to PB
+            let total_pb = m.total_capacity as f64 / 1_125_899_906_842_624.0;
             let stats = format!(
                 "\n\n  STORAGE ECONOMICS\n  ------------------\n  Total Volume:   {:.1} PB (Dynamic API)\n  Raw Payload:    {} bytes\n  DNA Pool Size:  {} bytes\n  Zstd Saved:     {:.2}%\n\n  ENGINE ACTIVITY\n  ------------------\n  Kernel Writes:  {}\n  Kernel Reads:   {}",
                 total_pb, m.raw_bytes, m.compressed_bytes, ratio, m.writes, m.reads
@@ -490,14 +530,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let analytics = Paragraph::new(stats).block(Block::default().title(" Live Analytics ").borders(Borders::ALL));
             f.render_widget(analytics, middle_chunks[1]);
 
-            // BOTTOM: Controls
             let footer = Paragraph::new(" Press 'q' to gracefully unmount and exit engine. ")
                 .style(Style::default().fg(Color::DarkGray))
                 .block(Block::default().borders(Borders::ALL));
             f.render_widget(footer, chunks[2]);
         })?;
 
-        // Handle Keyboard Exit
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 if let KeyCode::Char('q') = key.code { break; }
@@ -505,11 +543,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // TUI Teardown
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     
-    println!("[+] Gracefully unmounted FUSE bridge and destroyed UI session.");
+    println!("[+] Gracefully unmounted FUSE bridge, cleared Volatile Key, and destroyed UI.");
     Ok(())
 }

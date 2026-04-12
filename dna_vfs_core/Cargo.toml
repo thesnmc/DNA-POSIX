@@ -4,10 +4,13 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+aes-gcm = "0.10.3"
+argon2 = "0.5.3"
 crossterm = "0.29.0"
 env_logger = "0.11.10"
 fuser = "0.11.1"
 libc = "0.2.184"
 log = "0.4.29"
 ratatui = "0.30.0"
+rpassword = "7.4.0"
 zstd = "0.13.3"
