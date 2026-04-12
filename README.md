@@ -15,6 +15,22 @@ Engineered natively in pure Rust, the **V8 Enterprise Core** bypasses traditiona
 
 ## 🚀 The V8 Architecture (Enterprise Features)
 
+graph TD
+    A[Linux Kernel / User] -->|Standard POSIX Commands| B(V8 FUSE Bridge<br/>Rust C-Bindings)
+    
+    B -->|Delete File| C{Garbage Collector}
+    C --> D[/.bio_trash Quarantine]
+    
+    B -->|Write File| E[Zstandard Compression]
+    E --> F[AES-256-GCM Encryption<br/>Argon2id Key]
+    F --> G[Goldman Encoding<br/>No Repeating Bases]
+    G --> H[Block Allocator & Primers<br/>Shatter into oligos]
+    H --> I[Triple Modular Redundancy<br/>Math Healing]
+    
+    I --> J{Geographic RAID 1}
+    J -->|Mirror A| K[(Volatile RAM Vault A<br/>tmpfs)]
+    J -->|Mirror B| L[(Volatile RAM Vault B<br/>tmpfs)]
+
 This is not a toy script. It is a fully armored, enterprise-grade deep-tech bridge between digital logic and synthetic biology.
 
 ### ⚙️ Kernel & Infrastructure
