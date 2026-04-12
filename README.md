@@ -15,6 +15,7 @@ Engineered natively in pure Rust, the **V8 Enterprise Core** bypasses traditiona
 
 ## 🚀 The V8 Architecture (Enterprise Features)
 
+```mermaid
 graph TD
     A[Linux Kernel / User] -->|Standard POSIX Commands| B(V8 FUSE Bridge<br/>Rust C-Bindings)
     
@@ -30,6 +31,7 @@ graph TD
     I --> J{Geographic RAID 1}
     J -->|Mirror A| K[(Volatile RAM Vault A<br/>tmpfs)]
     J -->|Mirror B| L[(Volatile RAM Vault B<br/>tmpfs)]
+```
 
 This is not a toy script. It is a fully armored, enterprise-grade deep-tech bridge between digital logic and synthetic biology.
 
@@ -57,35 +59,24 @@ This is not a toy script. It is a fully armored, enterprise-grade deep-tech brid
 
 ## 🛠️ Installation & Deployment
 
-The V8 Core requires zero Python. It is a pure, compiled Rust binary.
+The V8 Core requires zero Python. It is a pure, compiled Rust binary managed by an automated deployment script.
 
 **Prerequisites:**
 * `rustc` and `cargo` installed.
 * `fuse` installed on your Linux kernel (`sudo apt install fuse`).
 
-### 1. Build the Raw-Metal Core
+### 1. Download the Engine
 ```bash
 git clone [https://github.com/TheSNMC/DNA-POSIX.git](https://github.com/TheSNMC/DNA-POSIX.git)
-cd DNA-POSIX/dna_vfs_core
-cargo build --release
+cd DNA-POSIX
 ```
 
-### 2. Spin Up the Anti-Forensic RAM Vaults
-Allocate the volatile tmpfs infrastructure for the primary vault, the RAID mirror, and the WAL journal. Create the quarantine and drive directories.
+### 2. The One-Click Enterprise Boot
+Run the automated lab deployment script. This script will automatically compile the Rust core, detect your system's available RAM, dynamically allocate the `tmpfs` biological vaults, and launch the engine.
 ```bash
-mkdir -p ~/dna-posix/dna_vfs/.dna_cache/{physical_pool,vault_b,journal}
-mkdir -p ~/dna-posix/dna_vfs/{bio_drive,.bio_trash}
-
-# Mount the volatile memory sectors (Data physically dies on power-loss)
-sudo mount -t tmpfs -o size=1G tmpfs ~/dna-posix/dna_vfs/.dna_cache/physical_pool
-sudo mount -t tmpfs -o size=1G tmpfs ~/dna-posix/dna_vfs/.dna_cache/vault_b
+./launch_lab.sh
 ```
-
-### 3. Boot the Matrix Command Center (Zero-Trust Initialization)
-Launch the engine. It will halt and demand a Master Mount Password (visually suppressed via rpassword). The engine uses Argon2id to forge a 256-bit AES key in volatile RAM, mounts to the OS, and spawns the live TUI dashboard.
-```bash
-./target/release/dna_vfs_core ~/dna-posix/dna_vfs/bio_drive
-```
+*Note: The engine will halt during boot and demand a Master Mount Password (visually suppressed via `rpassword`). It uses Argon2id to forge a 256-bit AES key in volatile RAM before spawning the live TUI dashboard.*
 
 ---
 
