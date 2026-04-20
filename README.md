@@ -124,4 +124,3 @@ The Rust memory manager will automatically trap the exit signal, safely unmount 
 
 ## 📜 License & Intellectual Property
 © 2026 TheSNMC
-Licensed under the Apache License 2.0 to ensure industrial patent protection and compatibility with deep-tech enterprise integrations. See `LICENSE` for more information.
