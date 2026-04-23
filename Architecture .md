@@ -1,5 +1,5 @@
 # 🏗️ Architecture & Design Document: DNA-POSIX V8 Enterprise Core
-**Version:** 1.0.0 | **Date:** 2026-04-23 | **Author:** TheSNMC
+**Version:** 1.0.0 | **Date:** 2026-04-23 | **Author:** Sujay
 
 ---
 
