@@ -1,7 +1,7 @@
 # 🚀 DNA-POSIX: V8 Enterprise Core
 > A zero-trust, anti-forensic Virtual File System bridging the Linux kernel and synthetic biology for complete data sovereignty.
 
-[![License](https://img.shields.io/badge/License-AGPLv3-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/License-TheSNMC-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20FUSE-lightgrey)]()
 [![Architecture](https://img.shields.io/badge/Architecture-Volatile--RAM-success)]()
 
