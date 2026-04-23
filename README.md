@@ -80,5 +80,5 @@ graph TD
 Contributions, issues, and feature requests are welcome. Feel free to check the issues page if you want to contribute. (Currently seeking hardware engineers to build physical synthesizer APIs).
 
 ## 📄 License
-This project is licensed under the GNU Affero General Public License v3.0 (AGPLv3) - see the LICENSE file for details.  
+See the LICENSE file for details.  
 Built by an independent developer in Chennai, India.
